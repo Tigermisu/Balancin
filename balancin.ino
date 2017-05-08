@@ -1,15 +1,26 @@
+#include <PID_v1.h>
+#include <LMotorController.h>
 #include "I2Cdev.h"
+
 #include "MPU6050_6Axis_MotionApps20.h"
+
 #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-#include "Wire.h"
+    #include "Wire.h"
 #endif
-#define OUTPUT_READABLE_YAWPITCHROLL
-#define INTERRUPT_PIN 2
-#define LED_PIN 13 
+
+
+#define LOG_INPUT 0
+#define MANUAL_TUNING 0
+#define LOG_PID_CONSTANTS 0 //MANUAL_TUNING must be 1
+#define MOVE_BACK_FORTH 0         // estaba en 1
+
+#define MIN_ABS_SPEED 30
+
+//MPU
 
 
 MPU6050 mpu;
-bool blinkState = false;
+
 // MPU control/status vars
 bool dmpReady = false;  // set true if DMP init was successful
 uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
@@ -18,83 +29,89 @@ uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
 uint16_t fifoCount;     // count of all bytes currently in FIFO
 uint8_t fifoBuffer[64]; // FIFO storage buffer
 
-// orientation variables
+// orientation/motion vars
 Quaternion q;           // [w, x, y, z]         quaternion container
-VectorInt16 aa;         // [x, y, z]            accel sensor measurements
-VectorInt16 aaReal;     // [x, y, z]            gravity-free accel sensor measurements
-VectorInt16 aaWorld;    // [x, y, z]            world-frame accel sensor measurements
 VectorFloat gravity;    // [x, y, z]            gravity vector
-float euler[3];         // [psi, theta, phi]    Euler angle container
 float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
 
-//PID control variables
 
-  float CurrentValue=0;
-  float U=0;
-  float UAnterior=0;
-  float Error=0;
-  float ErrorAnterior=0;
-  float ErrorPreAnterior=0;
-  float Kp=7.07;
-  float Ki=0.19;
-  float Kd=0.01;         
-  float Referencia=(-5);
-  float PWMdouble;
-  int PWM;
+//PID
 
 
-//motor
+#if MANUAL_TUNING
+  double kp , ki, kd;
+  double prevKp, prevKi, prevKd;
+#endif
+double originalSetpoint = 178.48;                               //178.48
+double setpoint = originalSetpoint;
+double movingAngleOffset = 0.1, ;                          //0.1
+double input, output, turnOffset;
+int moveState=0; //0 = balance; 1 = back; 2 = forth
 
-int ena1=3;
-int ena2=4;
-
-int in1=31;
-int in2=33;
-int in3=35;
-int in4=37;
+#if MANUAL_TUNING
+  PID pid(&input, &output, &setpoint, 0, 0, 0, DIRECT);
+#else
+  PID pid(&input, &output, &setpoint, 21, 55, 1, DIRECT);     // 19.9, 65, 1 funciona bien
+#endif
 
 
-// packet structure for InvenSense teapot demo
-uint8_t teapotPacket[14] = { '$', 0x02, 0,0, 0,0, 0,0, 0,0, 0x00, 0x00, '\r', '\n' };
+//MOTOR CONTROLLER
+
+
+int ENA = 3;
+int IN1 = 4;
+int IN2 = 8;
+int IN3 = 5;
+int IN4 = 7;
+int ENB = 6;
+int valin1;
+int valin2;
+int valena;
+
+
+//timers
+
+
+long time1Hz = 0;
+long time5Hz = 0;
+
 
 volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
-void dmpDataReady() {
+void dmpDataReady()
+{
     mpuInterrupt = true;
 }
 
-void setup() {
+
+void setup()
+{     
+    pinMode(ENA,OUTPUT);
+    pinMode(IN1,OUTPUT);
+    pinMode(IN2,OUTPUT);
+    pinMode(IN3,OUTPUT);
+    pinMode(IN4,OUTPUT);
+    pinMode(ENB,OUTPUT);
+    
+    
     // join I2C bus (I2Cdev library doesn't do this automatically)
     #if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
         Wire.begin();
-        Wire.setClock(400000); // 400kHz I2C clock. Comment this line if having compilation difficulties
+        TWBR = 24; // 400kHz I2C clock (200kHz if CPU is 8MHz)
     #elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
         Fastwire::setup(400, true);
     #endif
 
-
-    Serial.begin(115200);
-    while (!Serial); // wait for Leonardo enumeration, others continue immediately
-
-    //h bridge pins for the output
-    pinMode(ena1, OUTPUT);
-    pinMode(ena2, OUTPUT);
-    pinMode(in1, OUTPUT);
-    pinMode(in2, OUTPUT);
-    pinMode(in3, OUTPUT);
-    pinMode(in4, OUTPUT);
+  
+    Serial.begin(9600); // Bluetooth module's baud set to 9600
+    while (!Serial); // wait for serial to open
 
     // initialize device
+    Serial.println(F("Initializing I2C devices..."));
     mpu.initialize();
-    pinMode(INTERRUPT_PIN, INPUT);
 
     // verify connection
+    Serial.println(F("Testing device connections..."));
     Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
-
-
-    Serial.println(F("Start"));
-    while (Serial.available() && Serial.read()); // empty buffer
-    while (!Serial.available());                 // wait for data
-    while (Serial.available() && Serial.read()); // empty buffer again
 
     // load and configure the DMP
     Serial.println(F("Initializing DMP..."));
@@ -107,14 +124,15 @@ void setup() {
     mpu.setZAccelOffset(1788); // 1688 factory default for my test chip
 
     // make sure it worked (returns 0 if so)
-    if (devStatus == 0) {
+    if (devStatus == 0)
+    {
         // turn on the DMP, now that it's ready
         Serial.println(F("Enabling DMP..."));
         mpu.setDMPEnabled(true);
 
         // enable Arduino interrupt detection
         Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
-        attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), dmpDataReady, RISING);
+        attachInterrupt(0, dmpDataReady, RISING);
         mpuIntStatus = mpu.getIntStatus();
 
         // set our DMP Ready flag so the main loop() function knows it's okay to use it
@@ -123,7 +141,15 @@ void setup() {
 
         // get expected DMP packet size for later comparison
         packetSize = mpu.dmpGetFIFOPacketSize();
-    } else {
+        
+        //setup PID
+        
+        pid.SetMode(AUTOMATIC);
+        pid.SetSampleTime(10);
+        pid.SetOutputLimits(-255, 255);  
+    }
+    else
+    {
         // ERROR!
         // 1 = initial memory load failed
         // 2 = DMP configuration updates failed
@@ -132,23 +158,108 @@ void setup() {
         Serial.print(devStatus);
         Serial.println(F(")"));
     }
-    pinMode(LED_PIN, OUTPUT);
 }
 
 
-
-// ================================================================
-// ===                    MAIN PROGRAM LOOP                     ===
-// ================================================================
-
-void loop() {
+void loop()
+{
     // if programming failed, don't try to do anything
     if (!dmpReady) return;
 
     // wait for MPU interrupt or extra packet(s) available
-    while (!mpuInterrupt && fifoCount < packetSize) {
+    while (!mpuInterrupt && fifoCount < packetSize)
+    {
+        //no mpu data - performing PID calculations and output to motors
+        if(Serial.available()) {
+          char c = Serial.read();
+          switch(c) {
+           case 'F':
+            setpoint += movingAngleOffset;
+            break;
+           case 'B':
+            setpoint -= movingAngleOffset;
+            break;
+           case 'L':
+            turnOffset = -20;
+            break;
+           case 'R':
+            turnOffset = 20;
+            break; 
+           case 'C':
+            turnOffset = 0;
+            setpoint = originalSetpoint;
+            break;
+          }              
+          
+        }
 
+        
+        
+        pid.Compute();
+      
+        if(output>0)        //giro a la derecha
+        {
+          valin1=1;
+          valin2=0;
+          digitalWrite(IN1,LOW);
+          digitalWrite(IN2,HIGH);
+          
+          digitalWrite(IN3,HIGH);
+          digitalWrite(IN4,LOW);
+        }
+        if(output<0)        //giro a la izquierda
+        {
+          valin1=0;
+          valin2=1;
+          digitalWrite(IN1,HIGH);
+          digitalWrite(IN2,LOW);
+          
+          digitalWrite(IN3,LOW);
+          digitalWrite(IN4,HIGH);
+        }
 
+        valena = abs(output);
+        
+        analogWrite(ENA,abs(valena + turnOffset));
+        analogWrite(ENB,abs(valena - turnOffset));
+      
+        //Serial.println(output);
+
+        /*
+                int ENA = 3;
+                int IN1 = 4;
+                int IN2 = 8;
+                int IN3 = 5;
+                int IN4 = 7;
+                int ENB = 6;
+        */
+        Serial.print(input);
+        Serial.print("             ");
+        Serial.print(valena);
+        Serial.print("    ");
+        Serial.print(valin1);
+        Serial.print("    ");
+        Serial.println(valin2);
+
+        
+
+        
+
+        
+        
+        unsigned long currentMillis = millis();
+
+        if (currentMillis - time1Hz >= 1000)
+        {
+            loopAt1Hz();
+            time1Hz = currentMillis;
+        }
+        
+        if (currentMillis - time5Hz >= 5000)
+        {
+            loopAt5Hz();
+            time5Hz = currentMillis;
+        }
     }
 
     // reset interrupt flag and get INT_STATUS byte
@@ -159,13 +270,16 @@ void loop() {
     fifoCount = mpu.getFIFOCount();
 
     // check for overflow (this should never happen unless our code is too inefficient)
-    if ((mpuIntStatus & 0x10) || fifoCount == 1024) {
+    if ((mpuIntStatus & 0x10) || fifoCount == 1024)
+    {
         // reset so we can continue cleanly
         mpu.resetFIFO();
         Serial.println(F("FIFO overflow!"));
 
     // otherwise, check for DMP data ready interrupt (this should happen frequently)
-    } else if (mpuIntStatus & 0x02) {
+    }
+    else if (mpuIntStatus & 0x02)
+    {
         // wait for correct available data length, should be a VERY short wait
         while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
 
@@ -176,94 +290,82 @@ void loop() {
         // (this lets us immediately read more without waiting for an interrupt)
         fifoCount -= packetSize;
 
-        #ifdef OUTPUT_READABLE_YAWPITCHROLL
-            // display Euler angles in degrees
-            mpu.dmpGetQuaternion(&q, fifoBuffer);
-            mpu.dmpGetGravity(&gravity, &q);
-            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-            
-            
-          CurrentValue=ypr[2] * 180/M_PI;
-
-      
-      Error=Referencia-CurrentValue;
-      U=Kp*(Error-ErrorAnterior)+Ki*Error+Kd*(Error-2*ErrorAnterior+ErrorPreAnterior)+UAnterior;
-      
-      ErrorPreAnterior=ErrorAnterior;     
-      UAnterior=U;
-      ErrorAnterior=Error;
-
-      
-
-
-
-      if(U<-256)
-      {
-        U=-255;
-        UAnterior=-255;
-      }
-
-      
-      if(U>255)
-      {
-      
-        U=255;
-        UAnterior=255;
-      }
-
-
-      
-          if(CurrentValue>Referencia){
-
-          digitalWrite(in1,LOW);
-          digitalWrite(in2,HIGH);
-
-          digitalWrite(in3,LOW);
-          digitalWrite(in4,HIGH);
-          
-
-          }
-        
-          if(CurrentValue<Referencia){
-        
-          digitalWrite(in1,HIGH);
-          digitalWrite(in2,LOW);
-
-          digitalWrite(in3,HIGH);
-          digitalWrite(in4,LOW);
-        
-          }
-            
-          analogWrite(ena1,abs(U));       
-          analogWrite(ena2, abs(U));
-          
-            
-
-            
-            
-
-            
-            Serial.print("Esfuerzo: ");
-            Serial.println(U);
-            /*
-            Serial.print("CurrentValue: ");
-            Serial.println(CurrentValue);
-            Serial.print("Referencia: ");
-            Serial.println(Referencia);
-            Serial.print("Error: ");
-            Serial.println(Error);
-            Serial.print("UAnterior: ");
-            Serial.println(UAnterior);
-            Serial.print("ErrorAnterior: ");
-            Serial.println(ErrorAnterior);
-            Serial.print("ErrorPreAnterior: ");
-            Serial.println(ErrorPreAnterior);
-            Serial.println(" ");
-            Serial.println(" ");
-            Serial.println(" ");*/
-
-
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+        #if LOG_INPUT
+           /* Serial.print("ypr\t");
+            Serial.print(ypr[0] * 180/M_PI);
+            Serial.print("\t");
+            Serial.print(ypr[1] * 180/M_PI);
+            Serial.print("\t");*/
+            Serial.println(ypr[2] * 180/M_PI);
         #endif
+        input = ypr[2] * 180/M_PI + 180;
+   }
+}
 
+
+void loopAt1Hz()
+{
+#if MANUAL_TUNING
+    setPIDTuningValues();
+#endif
+}
+
+
+void loopAt5Hz()
+{
+    #if MOVE_BACK_FORTH
+        moveBackForth();
+    #endif
+}
+
+
+//move back and forth
+
+
+void moveBackForth()
+{
+    moveState++;
+    if (moveState > 2) moveState = 0;
+    
+    if (moveState == 0)
+      setpoint = originalSetpoint;
+    else if (moveState == 1)
+      setpoint = originalSetpoint - movingAngleOffset;
+    else
+      setpoint = originalSetpoint + movingAngleOffset;
+}
+
+
+//PID Tuning (3 potentiometers)
+
+#if MANUAL_TUNING
+void setPIDTuningValues()
+{
+    readPIDTuningValues();
+    
+    if (kp != prevKp || ki != prevKi || kd != prevKd)
+    {
+#if LOG_PID_CONSTANTS
+        Serial.print(kp);Serial.print(", ");Serial.print(ki);Serial.print(", ");Serial.println(kd);
+#endif
+
+        pid.SetTunings(kp, ki, kd);
+        prevKp = kp; prevKi = ki; prevKd = kd;
     }
 }
+
+
+void readPIDTuningValues()
+{
+    int potKp = analogRead(A0);
+    int potKi = analogRead(A1);
+    int potKd = analogRead(A2);
+        
+    kp = map(potKp, 0, 1023, 0, 25000) / 100.0; //0 - 250
+    ki = map(potKi, 0, 1023, 0, 100000) / 100.0; //0 - 1000
+    kd = map(potKd, 0, 1023, 0, 500) / 100.0; //0 - 5
+}
+#endif
